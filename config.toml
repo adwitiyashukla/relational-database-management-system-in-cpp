@@ -1,0 +1,24 @@
+[server]
+host = "127.0.0.1"
+port = 5433
+max_connections = 64
+
+[storage]
+data_dir = "data"
+buffer_pool_mb = 64
+
+[wal]
+segment_mb = 16
+fsync = true
+group_commit_delay_us = 0
+
+[checkpoint]
+interval_s = 30
+wal_mb = 64
+
+[txn]
+default_isolation = "read committed"
+lock_timeout_ms = 10000
+
+[gc]
+interval_ms = 20

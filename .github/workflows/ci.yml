@@ -1,0 +1,117 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    name: ${{ matrix.os }} ${{ matrix.compiler }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            compiler: gcc
+            cxx: g++
+          - os: ubuntu-24.04
+            compiler: clang
+            cxx: clang++
+          - os: macos-15
+            compiler: clang
+            cxx: clang++
+          - os: windows-2022
+            compiler: msvc
+            cxx: ""
+    steps:
+      - uses: actions/checkout@v5
+      - name: configure
+        shell: bash
+        run: |
+          if [ -n "${{ matrix.cxx }}" ]; then export CXX=${{ matrix.cxx }}; fi
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+      - name: build
+        run: cmake --build build --config Release --parallel
+      - name: test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+  sanitizers:
+    name: sanitize ${{ matrix.san }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        san: [address, undefined, thread]
+    steps:
+      - uses: actions/checkout@v5
+      - run: sudo sysctl -w vm.mmap_rnd_bits=28
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_COMPILER=clang++ -DRDBMS_SANITIZE=${{ matrix.san }}
+      - run: cmake --build build --parallel
+      - run: ctest --test-dir build --output-on-failure
+        env:
+          TSAN_OPTIONS: detect_deadlocks=0 halt_on_error=1
+
+  format:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - run: find src tests tools -name '*.cpp' -o -name '*.h' | xargs clang-format-18 --dry-run --Werror
+
+  integration:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install "psycopg[binary]"
+      - name: postgres client tools
+        run: |
+          if ! ls -d /usr/lib/postgresql/*/bin > /dev/null 2>&1; then sudo apt-get update && sudo apt-get install -y postgresql-16; fi
+          ls -d /usr/lib/postgresql/*/bin | sort -V | tail -1 >> "$GITHUB_PATH"
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --parallel
+      - name: crash sweep
+        run: ./build/rdbms-crashsim --seeds 1000
+      - name: start server
+        run: |
+          ./build/rdbms-server > server.log 2>&1 &
+          echo $! > server.pid
+          sleep 2
+      - name: isolation checker
+        run: python tools/isolation_check.py --seconds 10
+      - name: pgbench
+        run: |
+          ./build/rdbms-bench load --scale 1
+          pgbench -n -c 8 -j 4 -T 15 -h 127.0.0.1 -p 5433 -U ci rdbms
+      - name: kill during pgbench and recover
+        run: |
+          pid=$(cat server.pid)
+          kill "$pid"
+          while kill -0 "$pid" 2> /dev/null; do sleep 0.2; done
+          printf '[storage]\nbuffer_pool_mb = 8\n\n[checkpoint]\ninterval_s = 1\nwal_mb = 4\n' > stress.toml
+          q() { psql -h 127.0.0.1 -p 5433 -U ci -d rdbms -At -c "$1"; }
+          up() {
+            ./build/rdbms-server --config stress.toml >> server2.log 2>&1 &
+            pid=$!
+            for i in $(seq 1 50); do q "select 1" > /dev/null 2>&1 && return 0; sleep 0.2; done
+            cat server2.log
+            return 1
+          }
+          for round in 1 2 3 4 5 6; do
+            up
+            pgbench -n -c 8 -j 4 -T 10 -h 127.0.0.1 -p 5433 -U ci rdbms > pgbench.log 2>&1 || true &
+            sleep $((2 + round % 4))
+            kill -9 "$pid"
+            wait
+            up
+            a=$(q "select sum(abalance) from pgbench_accounts")
+            t=$(q "select sum(tbalance) from pgbench_tellers")
+            b=$(q "select sum(bbalance) from pgbench_branches")
+            h=$(q "select sum(delta) from pgbench_history")
+            echo "round $round: accounts $a tellers $t branches $b history $h"
+            if [ "$a" != "$t" ] || [ "$t" != "$b" ] || [ "$b" != "$h" ]; then cat server2.log; exit 1; fi
+            kill "$pid"
+            wait
+          done
+          grep "recovery took" server2.log
